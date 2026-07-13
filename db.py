@@ -466,6 +466,218 @@ def remove_question_tag(question_uuid, tag_uuid):
     conn.close()
 
 
+
+# ---------------------------------------------------------------------------
+# دوال قراءة فقط (read-only) لدعم الـ API الخاص بالـ Mini App
+# ---------------------------------------------------------------------------
+
+def get_sheet_full_detail(sheet_uuid, subject_uuid=None):
+    """يرجّع تفاصيل شيت كاملة: معلوماتها العامة + كل المواد المشتركة فيها +
+    كل أسئلتها (مع إجاباتها وتصنيفاتها). إذا انعطى subject_uuid، بيقتصر
+    عرض الأسئلة على هاي المادة بس (لأنو الشيت الواحدة ممكن تكون مشتركة بين
+    أكتر من مادة بنفس التاريخ)."""
+    conn = get_connection()
+    sheet_row = conn.execute(
+        "SELECT * FROM Sheet WHERE uuid = ?", (sheet_uuid,)
+    ).fetchone()
+    if not sheet_row:
+        conn.close()
+        return None
+
+    subject_rows = conn.execute(
+        "SELECT DISTINCT Subject.uuid, Subject.name FROM Subject "
+        "JOIN Question ON Question.subject_uuid = Subject.uuid "
+        "WHERE Question.sheet_uuid = ? ORDER BY Subject.name",
+        (sheet_uuid,),
+    ).fetchall()
+
+    if subject_uuid:
+        q_rows = conn.execute(
+            "SELECT * FROM Question WHERE sheet_uuid = ? AND subject_uuid = ? "
+            "ORDER BY display_order",
+            (sheet_uuid, subject_uuid),
+        ).fetchall()
+    else:
+        q_rows = conn.execute(
+            "SELECT * FROM Question WHERE sheet_uuid = ? ORDER BY display_order",
+            (sheet_uuid,),
+        ).fetchall()
+
+    questions = []
+    for q in q_rows:
+        answer_rows = conn.execute(
+            "SELECT uuid, text, answerLabel, isCorrect FROM Answer "
+            "WHERE question_uuid = ? ORDER BY answerLabel",
+            (q["uuid"],),
+        ).fetchall()
+        tag_rows = conn.execute(
+            "SELECT Tag.uuid, Tag.name FROM Tag "
+            "JOIN QuestionTag ON QuestionTag.tag_uuid = Tag.uuid "
+            "WHERE QuestionTag.question_uuid = ?",
+            (q["uuid"],),
+        ).fetchall()
+        questions.append(
+            {
+                "uuid": q["uuid"],
+                "text": q["text"],
+                "note": q["note"],
+                "display_order": q["display_order"],
+                "subject_uuid": q["subject_uuid"],
+                "answers": [
+                    {
+                        "uuid": a["uuid"],
+                        "text": a["text"],
+                        "label": a["answerLabel"],
+                        "is_correct": bool(a["isCorrect"]),
+                    }
+                    for a in answer_rows
+                ],
+                "tags": [
+                    {"uuid": t["uuid"], "name": t["name"]} for t in tag_rows
+                ],
+            }
+        )
+
+    conn.close()
+    return {
+        "uuid": sheet_row["uuid"],
+        "year": sheet_row["year"],
+        "term": sheet_row["term"],
+        "exam_date": sheet_row["examDate"],
+        "questions_count": len(questions),
+        "subjects": [{"uuid": s["uuid"], "name": s["name"]} for s in subject_rows],
+        "questions": questions,
+    }
+
+
+def get_overview_stats():
+    """إحصائيات عامة على كل قاعدة البيانات."""
+    conn = get_connection()
+    stats = {}
+    for table, key in (
+        ("Subject", "subjects"),
+        ("Sheet", "sheets"),
+        ("Question", "questions"),
+        ("Answer", "answers"),
+        ("Tag", "tags"),
+    ):
+        stats[key] = conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+    conn.close()
+    return stats
+
+
+def get_subject_stats(subject_uuid):
+    """إحصائيات مادة معينة: عدد الأسئلة، عدد الشيتات، وتوزيع التصنيفات."""
+    conn = get_connection()
+    subject_row = conn.execute(
+        "SELECT uuid, name FROM Subject WHERE uuid = ?", (subject_uuid,)
+    ).fetchone()
+    if not subject_row:
+        conn.close()
+        return None
+
+    questions_count = conn.execute(
+        "SELECT COUNT(*) c FROM Question WHERE subject_uuid = ?", (subject_uuid,)
+    ).fetchone()["c"]
+    sheets_count = conn.execute(
+        "SELECT COUNT(DISTINCT sheet_uuid) c FROM Question WHERE subject_uuid = ?",
+        (subject_uuid,),
+    ).fetchone()["c"]
+    tag_rows = conn.execute(
+        "SELECT Tag.uuid, Tag.name, TagStatistic.count FROM TagStatistic "
+        "JOIN Tag ON Tag.uuid = TagStatistic.tag_uuid "
+        "WHERE TagStatistic.subject_uuid = ? ORDER BY TagStatistic.count DESC",
+        (subject_uuid,),
+    ).fetchall()
+
+    conn.close()
+    return {
+        "uuid": subject_row["uuid"],
+        "name": subject_row["name"],
+        "questions_count": questions_count,
+        "sheets_count": sheets_count,
+        "tags": [
+            {"uuid": t["uuid"], "name": t["name"], "count": t["count"]}
+            for t in tag_rows
+        ],
+    }
+
+
+def get_tags_for_subject(subject_uuid):
+    """يرجّع تصنيفات مادة معينة، مرتبة تنازلياً حسب عدد مرات ظهورها\n    بالأسئلة (TagStatistic.count) - هيك أهم/أكتر تصنيف تكرار بالامتحانات\n    بيطلع أول واحد (\"الأولوية\")."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT Tag.uuid, Tag.name, COALESCE(TagStatistic.count, 0) AS cnt "
+        "FROM SubjectTag "
+        "JOIN Tag ON Tag.uuid = SubjectTag.tag_uuid "
+        "LEFT JOIN TagStatistic ON TagStatistic.tag_uuid = SubjectTag.tag_uuid "
+        "  AND TagStatistic.subject_uuid = SubjectTag.subject_uuid "
+        "WHERE SubjectTag.subject_uuid = ? "
+        "ORDER BY cnt DESC, Tag.name",
+        (subject_uuid,),
+    ).fetchall()
+    conn.close()
+    return [(r["uuid"], r["name"], r["cnt"]) for r in rows]
+
+
+def get_questions_by_tag(subject_uuid, tag_uuid, limit=200, offset=0):
+    """يرجّع كل أسئلة مادة معينة المصنّفة بتصنيف معين، مرتبة حسب أولوية\n    الشيت (الأحدث أولاً) ثم ترتيبها الطبيعي جواها - مع إجاباتها وتصنيفاتها\n    الكاملة (نفس شكل get_sheet_full_detail)."""
+    conn = get_connection()
+    q_rows = conn.execute(
+        "SELECT Question.*, Sheet.year AS sheet_year, Sheet.term AS sheet_term "
+        "FROM Question "
+        "JOIN QuestionTag ON QuestionTag.question_uuid = Question.uuid "
+        "JOIN Sheet ON Sheet.uuid = Question.sheet_uuid "
+        "WHERE QuestionTag.tag_uuid = ? AND Question.subject_uuid = ? "
+        "ORDER BY Sheet.year DESC, Question.display_order ASC "
+        "LIMIT ? OFFSET ?",
+        (tag_uuid, subject_uuid, limit, offset),
+    ).fetchall()
+    total = conn.execute(
+        "SELECT COUNT(*) c FROM Question "
+        "JOIN QuestionTag ON QuestionTag.question_uuid = Question.uuid "
+        "WHERE QuestionTag.tag_uuid = ? AND Question.subject_uuid = ?",
+        (tag_uuid, subject_uuid),
+    ).fetchone()["c"]
+
+    questions = []
+    for q in q_rows:
+        answer_rows = conn.execute(
+            "SELECT uuid, text, answerLabel, isCorrect FROM Answer "
+            "WHERE question_uuid = ? ORDER BY answerLabel",
+            (q["uuid"],),
+        ).fetchall()
+        tag_rows = conn.execute(
+            "SELECT Tag.uuid, Tag.name FROM Tag "
+            "JOIN QuestionTag ON QuestionTag.tag_uuid = Tag.uuid "
+            "WHERE QuestionTag.question_uuid = ?",
+            (q["uuid"],),
+        ).fetchall()
+        questions.append(
+            {
+                "uuid": q["uuid"],
+                "text": q["text"],
+                "note": q["note"],
+                "display_order": q["display_order"],
+                "sheet_uuid": q["sheet_uuid"],
+                "sheet_year": q["sheet_year"],
+                "sheet_term": q["sheet_term"],
+                "answers": [
+                    {
+                        "uuid": a["uuid"],
+                        "text": a["text"],
+                        "label": a["answerLabel"],
+                        "is_correct": bool(a["isCorrect"]),
+                    }
+                    for a in answer_rows
+                ],
+                "tags": [{"uuid": t["uuid"], "name": t["name"]} for t in tag_rows],
+            }
+        )
+    conn.close()
+    return questions, total
+
+
 def add_question_tag_full(question_uuid, tag_uuid):
     """بيربط تصنيف جديد بسؤال، وبيحدث SubjectTag و TagStatistic أوتوماتيك."""
     conn = get_connection()
