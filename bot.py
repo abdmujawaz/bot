@@ -50,7 +50,11 @@ logger = logging.getLogger(__name__)
 def start_api_server():
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"سيرفر الـ API شغال على المنفذ {port}")
-    uvicorn.run(api_app, host="0.0.0.0", port=port, log_level="warning")
+    # loop="asyncio" مهم جداً: uvicorn[standard] بيجيب uvloop معه، وuvloop
+    # بيغيّر إعدادات asyncio على مستوى البرنامج كامل مش بس هاد الخيط،
+    # وهيك بيخرب خيط البوت الرئيسي (run_polling). بإجبار asyncio العادي
+    # هون، بيضل خيط البوت الرئيسي شغال طبيعي بدون تعارض.
+    uvicorn.run(api_app, host="0.0.0.0", port=port, log_level="warning", loop="asyncio")
 
 
 # ---------------------------------------------------------------------------
