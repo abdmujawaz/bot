@@ -12,6 +12,8 @@ bot.py
 
 import os
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -33,6 +35,29 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# سيرفر HTTP صغير (بس عشان Render يعتبر التطبيق "شغال" ويأهله للخطة المجانية)
+# البوت نفسه بيشتغل بمنطق منفصل تماماً (Polling مع تليجرام) بخيط رئيسي
+# ---------------------------------------------------------------------------
+
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("البوت شغال ✅".encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass  # تجاهل تسجيل كل طلب health-check حتى ما يزعج اللوج
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    logger.info(f"سيرفر الـ health-check شغال على المنفذ {port}")
+    server.serve_forever()
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +681,8 @@ def main():
         raise RuntimeError("BOT_TOKEN مش موجود. تأكد من ملف .env")
 
     db.init_db()
+
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
