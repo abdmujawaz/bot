@@ -77,6 +77,20 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.warning(f"صار خطأ وتم تجاهله حتى يضل البوت شغال: {context.error}")
 
 
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يبعت نسخة من ملف قاعدة البيانات الحالي مباشرة - لأنو الخطة
+    المجانية بـ Render بتمسح الملفات المحلية عند أي restart/redeploy/نوم،
+    فلازم تاخد نسخة احتياطية بانتظام."""
+    if not os.path.exists(db.DB_PATH):
+        await update.message.reply_text("ما في قاعدة بيانات لسا، لسا ما ضفت أي ملف.")
+        return
+    await update.message.reply_document(
+        document=open(db.DB_PATH, "rb"),
+        filename="database.db",
+        caption="نسخة قاعدة البيانات الحالية 📦",
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📤 إضافة ملف جديد (txt)", callback_data="start_sendtxt")],
@@ -331,6 +345,11 @@ async def finalize_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"عدد التصنيفات المستخدمة: {len(tag_resolution)}\n"
     )
     await chat.send_message(summary)
+    await chat.send_document(
+        document=open(db.DB_PATH, "rb"),
+        filename="database.db",
+        caption="نسخة احتياطية أوتوماتيكية بعد الاستيراد 📦",
+    )
 
     context.user_data.clear()
 
@@ -689,6 +708,7 @@ def main():
     app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler("goto", cmd_goto))
     app.add_handler(CommandHandler("browse", cmd_browse))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     app.add_handler(CallbackQueryHandler(start_sendtxt, pattern=r"^start_sendtxt$"))
