@@ -11,14 +11,191 @@ db.py
     SQLite نفسه بيضمن انو ما في تكرار وانو الرقم دايماً تصاعدي.
 """
 
-import sqlite3
 import os
+
+import libsql
 
 import tagging
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_PATH = os.path.join(BASE_DIR, "schema.sql")
-DB_PATH = os.path.join(BASE_DIR, "database.db")
+# لو موجود ملف database_seed.db بجذر المشروع (نسخة مصدَّرة من قاعدة
+# البيانات القديمة عن طريق /export)، بينستخدم مرة وحدة بس لنقل البيانات
+# الحقيقية (الشيتات/الأسئلة/التصنيفات) لـ Turso أول ما يشتغل البوت.
+SEED_DB_PATH = os.path.join(BASE_DIR, "database_seed.db")
+
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
+
+# ---------------------------------------------------------------------------
+# غلاف (wrapper) بسيط حول مكتبة libsql - بيوفر نفس واجهة sqlite3.Connection
+# يلي كل db.py مبني عليها (execute / fetchone / fetchall بالوصول بالاسم
+# row["col"] / commit / close)، بس فعليًا شغال فوق Turso بدل SQLite محلي.
+# هيك ما احتجنا نلمس ولا سطر تاني بباقي الملف.
+# ---------------------------------------------------------------------------
+
+class _Row:
+    __slots__ = ("_data",)
+
+    def __init__(self, columns, values):
+        self._data = dict(zip(columns, values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self._data.values())[key]
+        return self._data[key]
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def keys(self):
+        return self._data.keys()
+
+    def __repr__(self):
+        return f"<Row {self._data}>"
+
+
+class _CursorWrapper:
+    def __init__(self, raw_cursor):
+        self._raw = raw_cursor
+        description = getattr(raw_cursor, "description", None) or []
+        self._columns = [d[0] for d in description]
+        self.lastrowid = getattr(raw_cursor, "lastrowid", None)
+        self.rowcount = getattr(raw_cursor, "rowcount", -1)
+
+    def fetchone(self):
+        row = self._raw.fetchone()
+        if row is None:
+            return None
+        return _Row(self._columns, row)
+
+    def fetchall(self):
+        return [_Row(self._columns, r) for r in self._raw.fetchall()]
+
+
+class _ConnectionWrapper:
+    def __init__(self, raw_conn):
+        self._raw = raw_conn
+
+    def execute(self, sql, params=()):
+        cur = self._raw.execute(sql, params)
+        return _CursorWrapper(cur)
+
+    def executescript(self, script):
+        for stmt in script.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self.execute(stmt)
+
+    def commit(self):
+        self._raw.commit()
+
+    def close(self):
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+
+def get_connection():
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise RuntimeError(
+            "متغيرات TURSO_DATABASE_URL و TURSO_AUTH_TOKEN غير موجودة - "
+            "لازم تنضاف كـ Environment Variables على Render."
+        )
+    raw = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+    raw.execute("PRAGMA foreign_keys = ON")
+    return _ConnectionWrapper(raw)
+
+
+def migrate_seed_data_if_needed():
+    """لو في ملف database_seed.db (نسخة مصدَّرة بالـ /export من قاعدة
+    البيانات القديمة) و Turso لسا فاضية من بيانات الامتحانات الحقيقية
+    (جدول Sheet فاضي)، بينسخ كل البيانات القديمة لـ Turso مرة وحدة بس.
+    آمنة تتكرر (idempotent) لأنها بتفحص أول قبل ما تنفذ أي شي، فمش خطر
+    تشتغل أكتر من مرة."""
+    if not os.path.exists(SEED_DB_PATH):
+        return
+
+    conn = get_connection()
+    already_migrated = conn.execute("SELECT COUNT(*) c FROM Sheet").fetchone()["c"]
+    if already_migrated:
+        conn.close()
+        return
+
+    print("[migrate] بلشت نقل البيانات القديمة من database_seed.db لـ Turso...")
+
+    import sqlite3 as _sqlite3
+
+    src = _sqlite3.connect(SEED_DB_PATH)
+    src.row_factory = _sqlite3.Row
+
+    # الترتيب مهم: الجداول الأب قبل الجداول يلي فيها foreign key عليها
+    tables = [
+        "Collage", "Term", "Subject", "Tag",
+        "Sheet", "Question", "Answer",
+        "QuestionTag", "SubjectTag", "TagStatistic",
+    ]
+    for table in tables:
+        try:
+            rows = src.execute(f"SELECT * FROM {table}").fetchall()
+        except _sqlite3.OperationalError:
+            continue
+        if not rows:
+            continue
+        columns = rows[0].keys()
+        placeholders = ", ".join("?" for _ in columns)
+        col_list = ", ".join(columns)
+        for row in rows:
+            values = tuple(row[c] for c in columns)
+            conn.execute(
+                f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})",
+                values,
+            )
+        print(f"[migrate]   {table}: نُقل {len(rows)} صف")
+
+    conn.commit()
+    conn.close()
+    src.close()
+    print("[migrate] خلصت عملية نقل البيانات ✅")
+
+
+def export_snapshot(path):
+    """يبني ملف SQLite محلي طازة (لأمر /export) فيه نسخة كاملة من كل
+    بيانات Turso الحالية - بديل الملف المحلي القديم يلي ما عاد موجود."""
+    import sqlite3 as _sqlite3
+
+    if os.path.exists(path):
+        os.remove(path)
+
+    dest = _sqlite3.connect(path)
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        dest.executescript(f.read())
+
+    conn = get_connection()
+    tables = [
+        "Collage", "Term", "Subject", "Tag",
+        "Sheet", "Question", "Answer",
+        "QuestionTag", "SubjectTag", "TagStatistic",
+    ]
+    for table in tables:
+        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        if not rows:
+            continue
+        columns = list(rows[0].keys())
+        placeholders = ", ".join("?" for _ in columns)
+        col_list = ", ".join(columns)
+        for row in rows:
+            values = tuple(row[c] for c in columns)
+            dest.execute(
+                f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})",
+                values,
+            )
+    dest.commit()
+    dest.close()
+    conn.close()
+    return path
 
 # ---------------------------------------------------------------------------
 # البيانات المرجعية الثابتة
@@ -110,13 +287,6 @@ BROAD_PREFIX_ALIASES = {
 }
 
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def _migrate_add_question_subject_uuid(conn):
     """للقواعد الموجودة من قبل (قبل إضافة هالعمود) - يضيفه تلقائياً بدون ما يفقد أي بيانات."""
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(Question)").fetchall()]
@@ -152,6 +322,7 @@ def init_db():
         )
     conn.commit()
     conn.close()
+    migrate_seed_data_if_needed()
 
 
 def get_all_subjects():
@@ -178,6 +349,83 @@ def create_new_tag(name):
     conn.commit()
     conn.close()
     return new_uuid
+
+
+def add_tag_to_subject(subject_uuid, name):
+    """ينشئ تصنيف جديد فاضي (بدون أسئلة) ويربطه مباشرة بمادة معيّنة -
+    تستخدمها شاشة \"إدارة التصنيفات\" بالبوت لإضافة تصنيف يدوياً. هيك
+    التصنيف بيصير متاح تلقائياً بعملية المطابقة بالمرة الجاية يلي
+    بترفع فيها ملف."""
+    tag_uuid = create_new_tag(name)
+    conn = get_connection()
+    link_subject_tag(conn, subject_uuid, tag_uuid)
+    conn.commit()
+    conn.close()
+    return tag_uuid
+
+
+def rename_tag(tag_uuid, new_name):
+    """يغيّر اسم تصنيف موجود - التغيير بينطبق بكل مكان مستخدم فيه هاد
+    التصنيف (لأنو Tag جدول مشترك)."""
+    conn = get_connection()
+    conn.execute("UPDATE Tag SET name = ? WHERE uuid = ?", (new_name, tag_uuid))
+    conn.execute(
+        "UPDATE TagStatistic SET name = ? WHERE tag_uuid = ?", (new_name, tag_uuid)
+    )
+    conn.commit()
+    conn.close()
+
+
+def merge_tags(source_uuid, target_uuid):
+    """يدمج تصنيف (source) جوا تصنيف تاني موجود أصلاً (target): كل سؤال
+    كان متصنّف بـ source بيصير متصنّف بـ target، إحصائيات source بتنضاف
+    لإحصائيات target، وبعدين تصنيف source بينحذف نهائياً."""
+    conn = get_connection()
+
+    q_rows = conn.execute(
+        "SELECT question_uuid FROM QuestionTag WHERE tag_uuid = ?", (source_uuid,)
+    ).fetchall()
+    for r in q_rows:
+        link_question_tag(conn, r["question_uuid"], target_uuid)
+    conn.execute("DELETE FROM QuestionTag WHERE tag_uuid = ?", (source_uuid,))
+
+    subj_rows = conn.execute(
+        "SELECT subject_uuid FROM SubjectTag WHERE tag_uuid = ?", (source_uuid,)
+    ).fetchall()
+    for r in subj_rows:
+        link_subject_tag(conn, r["subject_uuid"], target_uuid)
+    conn.execute("DELETE FROM SubjectTag WHERE tag_uuid = ?", (source_uuid,))
+
+    stat_rows = conn.execute(
+        "SELECT * FROM TagStatistic WHERE tag_uuid = ?", (source_uuid,)
+    ).fetchall()
+    for s in stat_rows:
+        target_stat = conn.execute(
+            "SELECT id FROM TagStatistic WHERE tag_uuid = ? AND subject_uuid = ?",
+            (target_uuid, s["subject_uuid"]),
+        ).fetchone()
+        if target_stat:
+            conn.execute(
+                "UPDATE TagStatistic SET count = count + ?, banksCount = banksCount + ?, "
+                "examsCount = examsCount + ? WHERE id = ?",
+                (
+                    s["count"] or 0,
+                    s["banksCount"] or 0,
+                    s["examsCount"] or 0,
+                    target_stat["id"],
+                ),
+            )
+            conn.execute("DELETE FROM TagStatistic WHERE id = ?", (s["id"],))
+        else:
+            conn.execute(
+                "UPDATE TagStatistic SET tag_uuid = ? WHERE id = ?",
+                (target_uuid, s["id"]),
+            )
+
+    conn.execute("DELETE FROM Tag WHERE uuid = ?", (source_uuid,))
+
+    conn.commit()
+    conn.close()
 
 
 def find_matching_sheet(year, term_text, similarity_threshold=0.80):
@@ -470,6 +718,21 @@ def remove_question_tag(question_uuid, tag_uuid):
 # ---------------------------------------------------------------------------
 # دوال قراءة فقط (read-only) لدعم الـ API الخاص بالـ Mini App
 # ---------------------------------------------------------------------------
+
+def get_all_sheets(limit=100, offset=0):
+    """كل الشيتات (بكل المواد)، مرتبة حسب السنة الأحدث أولاً - لمسار\n    \"تصفح حسب الشيت\" الجديد يلي بيبلش مباشرة من التاريخ بدون ما يختار\n    مادة الأول."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT uuid, year, term, questionsCount FROM Sheet "
+        "ORDER BY year DESC, id DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) c FROM Sheet").fetchone()["c"]
+    conn.close()
+    return [
+        (r["uuid"], r["year"], r["term"], r["questionsCount"]) for r in rows
+    ], total
+
 
 def get_sheet_full_detail(sheet_uuid, subject_uuid=None):
     """يرجّع تفاصيل شيت كاملة: معلوماتها العامة + كل المواد المشتركة فيها +
