@@ -34,8 +34,27 @@ def health():
 
 @app.get("/api/subjects")
 def api_subjects():
-    subjects = db.get_all_subjects()
-    return [{"uuid": uuid_, "name": name} for uuid_, name in subjects]
+    subjects = db.get_all_subjects_with_counts()
+    return [
+        {"uuid": uuid_, "name": name, "questions_count": count}
+        for uuid_, name, count in subjects
+    ]
+
+
+@app.get("/api/sheets")
+def api_all_sheets(
+    limit: int = Query(default=100, ge=1, le=300),
+    offset: int = Query(default=0, ge=0),
+):
+    """كل الشيتات بكل المواد، مرتبة حسب التاريخ (الأحدث أولاً) - يستخدمها\n    مسار \"تصفح حسب الشيت\" الجديد اللي بيبلش من التاريخ مباشرة."""
+    sheets, total = db.get_all_sheets(limit=limit, offset=offset)
+    return {
+        "total": total,
+        "sheets": [
+            {"uuid": uuid_, "year": year, "term": term, "questions_count": count}
+            for uuid_, year, term, count in sheets
+        ],
+    }
 
 
 @app.get("/api/subjects/{subject_uuid}/sheets")
