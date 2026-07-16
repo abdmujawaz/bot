@@ -332,6 +332,19 @@ def get_all_subjects():
     return [(r["uuid"], r["name"]) for r in rows]
 
 
+def get_all_subjects_with_counts():
+    """كل المواد مع عدد أسئلتها الإجمالي - تستخدمها شاشة \"التصنيفات\"
+    بالـ Mini App لعرض عدد الأسئلة جنب اسم كل مادة."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT Subject.uuid, Subject.name, COUNT(Question.uuid) AS cnt "
+        "FROM Subject LEFT JOIN Question ON Question.subject_uuid = Subject.uuid "
+        "GROUP BY Subject.uuid, Subject.name ORDER BY Subject.name"
+    ).fetchall()
+    conn.close()
+    return [(r["uuid"], r["name"], r["cnt"]) for r in rows]
+
+
 def get_all_tags():
     conn = get_connection()
     rows = conn.execute("SELECT uuid, name FROM Tag").fetchall()
