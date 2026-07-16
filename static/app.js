@@ -76,29 +76,26 @@ function renderHome() {
   screenEl.innerHTML = `
     <div class="mode-grid">
       <div class="mode-card" id="modeSheet">
-        <h2>📚 تصفح حسب الشيت</h2>
-        <p>اختر المادة، بعدها الشيت حسب السنة، وشوف كل أسئلته.</p>
+        <h2>📚 الدورات الامتحانية</h2>
       </div>
       <div class="mode-card" id="modeTag">
-        <h2>🏷️ تصفح حسب التصنيف</h2>
-        <p>اختر المادة، بعدها تصنيف مرتب حسب الأولوية، وحل أسئلته.</p>
+        <h2>🏷️ التصنيفات</h2>
       </div>
     </div>
   `;
-  document.getElementById("modeSheet").onclick = () =>
-    pushView(subjectsView("sheet"));
+  document.getElementById("modeSheet").onclick = () => pushView(allSheetsView());
   document.getElementById("modeTag").onclick = () =>
     pushView(subjectsView("tag"));
 }
 
 // ---------------------------------------------------------------------------
-// اختيار المادة
+// اختيار المادة (لمسار التصنيف بس)
 // ---------------------------------------------------------------------------
 
 function subjectsView(mode) {
   return {
     title: "اختر المادة",
-    eyebrow: mode === "sheet" ? "تصفح حسب الشيت" : "تصفح حسب التصنيف",
+    eyebrow: "تصفح حسب التصنيف",
     render: () => safeLoad(() => renderSubjects(mode)),
   };
 }
@@ -109,9 +106,8 @@ async function renderSubjects(mode) {
   screenEl.innerHTML = `<div class="card-list" id="list"></div>`;
   const list = document.getElementById("list");
   subjects.forEach((s) => {
-    const tile = makeTile(s.name, "");
-    tile.onclick = () =>
-      pushView(mode === "sheet" ? sheetsView(s) : tagsView(s));
+    const tile = makeTile(s.name, `عدد الأسئلة: ${s.questions_count}`);
+    tile.onclick = () => pushView(tagsView(s));
     list.appendChild(tile);
   });
 }
@@ -133,40 +129,39 @@ function makeTile(title, sub, rankNum) {
 }
 
 // ---------------------------------------------------------------------------
-// وضع الشيت: عرض الشيتات حسب السنة
+// وضع الشيت: تختار التاريخ مباشرة (بدون ما تختار مادة الأول)، وبتطلع كل
+// أسئلة كل المواد يلي عندها نفس التاريخ، مقسّمة بعنوان لكل مادة.
 // ---------------------------------------------------------------------------
 
-function sheetsView(subject) {
+function allSheetsView() {
   return {
-    title: subject.name,
-    eyebrow: "الشيتات — حسب السنة",
-    render: () => safeLoad(() => renderSheets(subject)),
+    title: "اختر الشيت",
+    eyebrow: "حسب التاريخ",
+    render: () => safeLoad(() => renderAllSheets()),
   };
 }
 
-async function renderSheets(subject) {
-  const data = await apiGet(`/api/subjects/${subject.uuid}/sheets?limit=100`);
-  if (!data.sheets.length) return showMessage("ما في شيتات لهاي المادة لسا.");
+async function renderAllSheets() {
+  const data = await apiGet("/api/sheets?limit=200");
+  if (!data.sheets.length) return showMessage("ما في شيتات مضافة لسا.");
   screenEl.innerHTML = `<div class="card-list" id="list"></div>`;
   const list = document.getElementById("list");
   data.sheets.forEach((sh) => {
     const label = `${sh.year || "—"} — ${sh.term || ""}`;
-    const tile = makeTile(label, `${sh.questions_count} سؤال`);
-    tile.onclick = () => pushView(sheetQuestionsView(subject, sh));
+    const tile = makeTile(label, `عدد الأسئلة: ${sh.questions_count}`);
+    tile.onclick = () => pushView(sheetGroupedQuestionsView(sh));
     list.appendChild(tile);
   });
 }
 
-function sheetQuestionsView(subject, sheet) {
+function sheetGroupedQuestionsView(sheet) {
   return {
     title: `${sheet.year || ""} — ${sheet.term || ""}`,
-    eyebrow: subject.name,
+    eyebrow: "كل المواد",
     render: () =>
       safeLoad(async () => {
-        const detail = await apiGet(
-          `/api/sheets/${sheet.uuid}?subject_uuid=${subject.uuid}`
-        );
-        renderQuestions(detail.questions, { showYearChip: false });
+        const detail = await apiGet(`/api/sheets/${sheet.uuid}`);
+        renderGroupedQuestions(detail);
       }),
   };
 }
@@ -213,71 +208,100 @@ function tagQuestionsView(subject, tag) {
 // عرض قائمة الأسئلة (نمط اختبار: اضغط جواب يبين صح/غلط)
 // ---------------------------------------------------------------------------
 
+function buildQuestionCard(q, { showYearChip }) {
+  const card = document.createElement("div");
+  card.className = "q-card";
+
+  const yearChip =
+    showYearChip && q.sheet_year
+      ? `<span class="year-chip">${escapeHtml(String(q.sheet_year))}</span>`
+      : "";
+  const hasNote = q.note && q.note.trim().length > 0;
+
+  card.innerHTML = `
+    <div class="q-head">
+      <div class="q-text">${escapeHtml(q.text)}</div>
+      <div class="q-meta">
+        ${yearChip}
+        <button class="note-btn" ${hasNote ? "" : "disabled"} title="الشرح">!</button>
+      </div>
+    </div>
+    <div class="answers"></div>
+  `;
+
+  card.querySelector(".note-btn").onclick = () => {
+    if (!hasNote) return;
+    noteBody.textContent = q.note;
+    noteModal.classList.remove("hidden");
+  };
+
+  const answersEl = card.querySelector(".answers");
+  let answered = false;
+
+  q.answers.forEach((a) => {
+    const btn = document.createElement("button");
+    btn.className = "answer-btn";
+    btn.innerHTML = `<span class="label">${escapeHtml(a.label || "")}</span><span>${escapeHtml(a.text)}</span>`;
+    btn.onclick = () => {
+      if (answered) return;
+      answered = true;
+      const allBtns = answersEl.querySelectorAll(".answer-btn");
+      allBtns.forEach((b) => (b.disabled = true));
+
+      if (a.is_correct) {
+        btn.classList.add("correct");
+      } else {
+        btn.classList.add("wrong");
+        const correctBtn = [...allBtns].find(
+          (_, idx) => q.answers[idx].is_correct
+        );
+        if (correctBtn) correctBtn.classList.add("correct");
+        allBtns.forEach((b) => {
+          if (b !== btn && !b.classList.contains("correct")) {
+            b.classList.add("disabled-choice");
+          }
+        });
+      }
+    };
+    answersEl.appendChild(btn);
+  });
+
+  return card;
+}
+
 function renderQuestions(questions, { showYearChip }) {
   if (!questions.length) return showMessage("ما في أسئلة هون.");
+  screenEl.innerHTML = `<div class="q-list" id="qlist"></div>`;
+  const qlist = document.getElementById("qlist");
+  questions.forEach((q) => {
+    qlist.appendChild(buildQuestionCard(q, { showYearChip }));
+  });
+}
+
+// شاشة الشيت الكاملة: كل المواد المشتركة بنفس التاريخ، كل مادة بعنوانها
+// وتحته أسئلتها بس (مرتبة حسب ترتيبها الطبيعي جوا الشيت).
+function renderGroupedQuestions(detail) {
+  if (!detail.subjects.length || !detail.questions.length) {
+    return showMessage("ما في أسئلة بهاد الشيت.");
+  }
 
   screenEl.innerHTML = `<div class="q-list" id="qlist"></div>`;
   const qlist = document.getElementById("qlist");
 
-  questions.forEach((q) => {
-    const card = document.createElement("div");
-    card.className = "q-card";
+  detail.subjects.forEach((subject) => {
+    const subjectQuestions = detail.questions
+      .filter((q) => q.subject_uuid === subject.uuid)
+      .sort((a, b) => a.display_order - b.display_order);
+    if (!subjectQuestions.length) return;
 
-    const yearChip =
-      showYearChip && q.sheet_year
-        ? `<span class="year-chip">${escapeHtml(String(q.sheet_year))}</span>`
-        : "";
-    const hasNote = q.note && q.note.trim().length > 0;
+    const header = document.createElement("div");
+    header.className = "subject-header";
+    header.innerHTML = `<span>${escapeHtml(subject.name)}</span><span class="subject-header-count">${subjectQuestions.length} سؤال</span>`;
+    qlist.appendChild(header);
 
-    card.innerHTML = `
-      <div class="q-head">
-        <div class="q-text">${escapeHtml(q.text)}</div>
-        <div class="q-meta">
-          ${yearChip}
-          <button class="note-btn" ${hasNote ? "" : "disabled"} title="الشرح">!</button>
-        </div>
-      </div>
-      <div class="answers"></div>
-    `;
-
-    card.querySelector(".note-btn").onclick = () => {
-      if (!hasNote) return;
-      noteBody.textContent = q.note;
-      noteModal.classList.remove("hidden");
-    };
-
-    const answersEl = card.querySelector(".answers");
-    let answered = false;
-
-    q.answers.forEach((a) => {
-      const btn = document.createElement("button");
-      btn.className = "answer-btn";
-      btn.innerHTML = `<span class="label">${escapeHtml(a.label || "")}</span><span>${escapeHtml(a.text)}</span>`;
-      btn.onclick = () => {
-        if (answered) return;
-        answered = true;
-        const allBtns = answersEl.querySelectorAll(".answer-btn");
-        allBtns.forEach((b) => (b.disabled = true));
-
-        if (a.is_correct) {
-          btn.classList.add("correct");
-        } else {
-          btn.classList.add("wrong");
-          const correctBtn = [...allBtns].find(
-            (_, idx) => q.answers[idx].is_correct
-          );
-          if (correctBtn) correctBtn.classList.add("correct");
-          allBtns.forEach((b) => {
-            if (b !== btn && !b.classList.contains("correct")) {
-              b.classList.add("disabled-choice");
-            }
-          });
-        }
-      };
-      answersEl.appendChild(btn);
+    subjectQuestions.forEach((q) => {
+      qlist.appendChild(buildQuestionCard(q, { showYearChip: false }));
     });
-
-    qlist.appendChild(card);
   });
 }
 
