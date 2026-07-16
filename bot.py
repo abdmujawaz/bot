@@ -75,15 +75,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يبعت نسخة من ملف قاعدة البيانات الحالي مباشرة - لأنو الخطة
-    المجانية بـ Render بتمسح الملفات المحلية عند أي restart/redeploy/نوم،
-    فلازم تاخد نسخة احتياطية بانتظام."""
-    if not os.path.exists(db.DB_PATH):
-        await update.message.reply_text("ما في قاعدة بيانات لسا، لسا ما ضفت أي ملف.")
-        return
+    """يبني ويبعت نسخة كاملة طازة من قاعدة بيانات Turso الحالية - أداة
+    نسخ احتياطي يدوية (البيانات نفسها هلق دائمة على Turso، هاد بس نسخة
+    إضافية تقدر تحتفظ فيها لحالك)."""
+    await update.message.reply_text("عم أجهز نسخة من قاعدة البيانات، لحظات...")
+    snapshot_path = os.path.join(os.path.dirname(__file__), "export_snapshot.db")
+    db.export_snapshot(snapshot_path)
     await update.message.reply_document(
-        document=open(db.DB_PATH, "rb"),
-        filename="database.db",
+        document=open(snapshot_path, "rb"),
+        filename="database_export.db",
         caption="نسخة قاعدة البيانات الحالية 📦",
     )
 
@@ -92,6 +92,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📤 إضافة ملف جديد (txt)", callback_data="start_sendtxt")],
         [InlineKeyboardButton("✏️ تعديل سؤال موجود", callback_data="start_editmenu")],
+        [InlineKeyboardButton("🏷️ إدارة التصنيفات", callback_data="start_tagmanage")],
     ]
     await update.message.reply_text(
         "أهلاً 👋 شو بدك تعمل؟",
@@ -110,7 +111,7 @@ async def start_editmenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_answer(query)
     keyboard = [
         [InlineKeyboardButton("🔍 بحث نصي", callback_data="editmode_search")],
-        [InlineKeyboardButton("📂 تصفح (مادة ← شيت ← سؤال)", callback_data="editmode_browse")],
+        [InlineKeyboardButton("📂 تصفح (تاريخ ← سؤال)", callback_data="editmode_browse")],
         [InlineKeyboardButton("🔢 رقم السؤال مباشرة", callback_data="editmode_goto")],
     ]
     await query.edit_message_text(
@@ -135,14 +136,81 @@ async def editmode_goto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def editmode_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _safe_answer(query)
-    subjects = db.get_all_subjects()
+    await _show_browse_dates(query, offset=0)
+
+
+async def _show_browse_dates(query, offset):
+    sheets, total = db.get_all_sheets(limit=RESULTS_PER_PAGE, offset=offset)
     keyboard = [
-        [InlineKeyboardButton(name, callback_data=f"browsesubj:{uuid_}:0")]
-        for uuid_, name in subjects
+        [
+            InlineKeyboardButton(
+                f"{year} - {term} ({count} سؤال)", callback_data=f"browsesheet2:{uuid_}"
+            )
+        ]
+        for uuid_, year, term, count in sheets
     ]
+    nav = []
+    if offset > 0:
+        nav.append(
+            InlineKeyboardButton("« السابق", callback_data=f"browsedate:{max(0, offset - RESULTS_PER_PAGE)}")
+        )
+    if offset + RESULTS_PER_PAGE < total:
+        nav.append(
+            InlineKeyboardButton("التالي »", callback_data=f"browsedate:{offset + RESULTS_PER_PAGE}")
+        )
+    if nav:
+        keyboard.append(nav)
     await query.edit_message_text(
-        "اختار المادة:", reply_markup=InlineKeyboardMarkup(keyboard)
+        "اختار التاريخ (الشيت):", reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+
+async def browse_date_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    offset = int(query.data.split(":", 1)[1])
+    await _show_browse_dates(query, offset)
+
+
+async def browse_sheet_grouped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض كل أسئلة شيت معينة (تاريخ واحد)، مقسّمة بعنوان لكل مادة
+    مشتركة فيها - بدل ما يطلب يختار مادة الأول."""
+    query = update.callback_query
+    await _safe_answer(query)
+    sheet_uuid = query.data.split(":", 1)[1]
+    detail = db.get_sheet_full_detail(sheet_uuid)
+    if not detail or not detail["questions"]:
+        await query.edit_message_text("ما في أسئلة بهاي الشيت.")
+        return
+
+    keyboard = []
+    for subject in detail["subjects"]:
+        subj_questions = sorted(
+            (q for q in detail["questions"] if q["subject_uuid"] == subject["uuid"]),
+            key=lambda q: q["display_order"] or 0,
+        )
+        if not subj_questions:
+            continue
+        keyboard.append(
+            [InlineKeyboardButton(f"—  {subject['name']}  —", callback_data="noop")]
+        )
+        for q in subj_questions:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{q['display_order']}. {_truncate(q['text'])}",
+                        callback_data=f"edit:{q['uuid']}",
+                    )
+                ]
+            )
+    keyboard.append([InlineKeyboardButton("« رجوع للتواريخ", callback_data="browsedate:0")])
+
+    title = f"{detail['year']} — {detail['term']}"
+    await query.edit_message_text(title, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _safe_answer(update.callback_query)
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +410,10 @@ async def finalize_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"عدد التصنيفات المستخدمة: {len(tag_resolution)}\n"
     )
     await chat.send_message(summary)
+    snapshot_path = os.path.join(os.path.dirname(__file__), "export_snapshot.db")
+    db.export_snapshot(snapshot_path)
     await chat.send_document(
-        document=open(db.DB_PATH, "rb"),
+        document=open(snapshot_path, "rb"),
         filename="database.db",
         caption="نسخة احتياطية أوتوماتيكية بعد الاستيراد 📦",
     )
@@ -396,74 +466,21 @@ async def cmd_goto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/browse -> تصفح مادة ← شيت ← سؤال"""
-    subjects = db.get_all_subjects()
-    keyboard = [
-        [InlineKeyboardButton(name, callback_data=f"browsesubj:{uuid_}:0")]
-        for uuid_, name in subjects
-    ]
-    await update.message.reply_text(
-        "اختار المادة:", reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def browse_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await _safe_answer(query)
-    _, subject_uuid, offset = query.data.split(":")
-    offset = int(offset)
-    sheets, total = db.get_sheets_by_subject(subject_uuid, limit=RESULTS_PER_PAGE, offset=offset)
-
+    """/browse -> تصفح حسب التاريخ (كل المواد المشتركة بنفس الشيت)"""
+    sheets, total = db.get_all_sheets(limit=RESULTS_PER_PAGE, offset=0)
     keyboard = [
         [
             InlineKeyboardButton(
-                f"{year} - {term} ({count} سؤال)",
-                callback_data=f"browsesheet:{uuid_}:{subject_uuid}:0",
+                f"{year} - {term} ({count} سؤال)", callback_data=f"browsesheet2:{uuid_}"
             )
         ]
         for uuid_, year, term, count in sheets
     ]
-    nav = []
-    if offset > 0:
-        nav.append(
-            InlineKeyboardButton("« السابق", callback_data=f"browsesubj:{subject_uuid}:{max(0, offset-RESULTS_PER_PAGE)}")
-        )
-    if offset + RESULTS_PER_PAGE < total:
-        nav.append(
-            InlineKeyboardButton("التالي »", callback_data=f"browsesubj:{subject_uuid}:{offset+RESULTS_PER_PAGE}")
-        )
-    if nav:
-        keyboard.append(nav)
-
-    await query.edit_message_text("اختار الشيت:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def browse_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await _safe_answer(query)
-    _, sheet_uuid, subject_uuid, offset = query.data.split(":")
-    offset = int(offset)
-    questions, total = db.get_questions_by_sheet(
-        sheet_uuid, subject_uuid=subject_uuid, limit=RESULTS_PER_PAGE, offset=offset
+    if offset_more := (total > RESULTS_PER_PAGE):
+        keyboard.append([InlineKeyboardButton("التالي »", callback_data=f"browsedate:{RESULTS_PER_PAGE}")])
+    await update.message.reply_text(
+        "اختار التاريخ (الشيت):", reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
-    keyboard = [
-        [InlineKeyboardButton(f"{order}. {_truncate(text)}", callback_data=f"edit:{uuid_}")]
-        for uuid_, text, order in questions
-    ]
-    nav = []
-    if offset > 0:
-        nav.append(
-            InlineKeyboardButton("« السابق", callback_data=f"browsesheet:{sheet_uuid}:{subject_uuid}:{max(0, offset-RESULTS_PER_PAGE)}")
-        )
-    if offset + RESULTS_PER_PAGE < total:
-        nav.append(
-            InlineKeyboardButton("التالي »", callback_data=f"browsesheet:{sheet_uuid}:{subject_uuid}:{offset+RESULTS_PER_PAGE}")
-        )
-    if nav:
-        keyboard.append(nav)
-
-    await query.edit_message_text("اختار السؤال:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,6 +619,139 @@ async def tag_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# إدارة التصنيفات (تغيير اسم / دمج بتصنيف تاني / إضافة تصنيف جديد)
+# ---------------------------------------------------------------------------
+
+def _tagmgr_keyboard(subject_uuid):
+    tags = db.get_tags_for_subject(subject_uuid)
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{name} ({count})", callback_data=f"tagmgr_pick:{uuid_}:{subject_uuid}"
+            )
+        ]
+        for uuid_, name, count in tags
+    ]
+    keyboard.append(
+        [InlineKeyboardButton("➕ إضافة تصنيف جديد", callback_data=f"tagmgr_new:{subject_uuid}")]
+    )
+    keyboard.append([InlineKeyboardButton("« رجوع للمواد", callback_data="start_tagmanage")])
+    text = (
+        "تصنيفات هاي المادة (الأكتر تكراراً أولاً):"
+        if tags
+        else "ما في تصنيفات لهاي المادة لسا. ضيف وحدة جديدة:"
+    )
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def start_tagmanage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    subjects = db.get_all_subjects()
+    keyboard = [
+        [InlineKeyboardButton(name, callback_data=f"tagmgr_subj:{uuid_}")]
+        for uuid_, name in subjects
+    ]
+    await query.edit_message_text(
+        "اختار المادة يلي بدك تدير تصنيفاتها:", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def tagmgr_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    subject_uuid = query.data.split(":", 1)[1]
+    text, keyboard = _tagmgr_keyboard(subject_uuid)
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+
+async def tagmgr_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    _, tag_uuid, subject_uuid = query.data.split(":")
+    tag_name = next(
+        (n for u, n, c in db.get_tags_for_subject(subject_uuid) if u == tag_uuid), ""
+    )
+    keyboard = [
+        [InlineKeyboardButton("✏️ تغيير الاسم", callback_data=f"tagmgr_rename:{tag_uuid}:{subject_uuid}")],
+        [InlineKeyboardButton("🔀 دمج بتصنيف تاني", callback_data=f"tagmgr_mergestart:{tag_uuid}:{subject_uuid}")],
+        [InlineKeyboardButton("« رجوع", callback_data=f"tagmgr_subj:{subject_uuid}")],
+    ]
+    await query.edit_message_text(
+        f"تصنيف: «{tag_name}»\nشو بدك تعمل؟", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def tagmgr_rename_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    _, tag_uuid, subject_uuid = query.data.split(":")
+    context.user_data["awaiting"] = ("tag_rename", tag_uuid, subject_uuid)
+    await query.edit_message_text("اكتب الاسم الجديد للتصنيف:")
+
+
+async def tagmgr_merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    _, source_uuid, subject_uuid = query.data.split(":")
+    tags = db.get_tags_for_subject(subject_uuid)
+    others = [(u, n) for u, n, c in tags if u != source_uuid]
+    if not others:
+        await query.edit_message_text("ما في تصنيفات تانية بهاي المادة تدمج فيها.")
+        return
+    keyboard = [
+        [InlineKeyboardButton(name, callback_data=f"tagmgr_mergeto:{source_uuid}:{u}:{subject_uuid}")]
+        for u, name in others
+    ]
+    keyboard.append(
+        [InlineKeyboardButton("« إلغاء", callback_data=f"tagmgr_pick:{source_uuid}:{subject_uuid}")]
+    )
+    await query.edit_message_text(
+        "اختار التصنيف الهدف (يلي بدك تدمج فيه):", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def tagmgr_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    _, source_uuid, target_uuid, subject_uuid = query.data.split(":")
+    tags = db.get_tags_for_subject(subject_uuid)
+    names = {u: n for u, n, c in tags}
+    source_name, target_name = names.get(source_uuid, ""), names.get(target_uuid, "")
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "✅ نعم، ادمج", callback_data=f"tagmgr_mergedo:{source_uuid}:{target_uuid}:{subject_uuid}"
+            ),
+            InlineKeyboardButton("❌ إلغاء", callback_data=f"tagmgr_pick:{source_uuid}:{subject_uuid}"),
+        ]
+    ]
+    await query.edit_message_text(
+        f"متأكد إنك بدك تدمج «{source_name}» جوا «{target_name}»؟\n"
+        f"كل أسئلة «{source_name}» بتصير متصنّفة «{target_name}»، و«{source_name}» بينحذف نهائياً.\n"
+        f"العملية ما بترجع ⚠️",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def tagmgr_merge_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    _, source_uuid, target_uuid, subject_uuid = query.data.split(":")
+    db.merge_tags(source_uuid, target_uuid)
+    text, keyboard = _tagmgr_keyboard(subject_uuid)
+    await query.edit_message_text(f"تمام، تم الدمج ✅\n\n{text}", reply_markup=keyboard)
+
+
+async def tagmgr_new_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    subject_uuid = query.data.split(":", 1)[1]
+    context.user_data["awaiting"] = ("tag_new", subject_uuid)
+    await query.edit_message_text("اكتب اسم التصنيف الجديد:")
+
+
+# ---------------------------------------------------------------------------
 # استقبال النصوص العادية (لما نكون بانتظار إدخال من المستخدم)
 # ---------------------------------------------------------------------------
 
@@ -658,6 +808,22 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("👀 عرض الإجابات", callback_data=f"editfield:answers:{question_uuid}")]]
         await update.message.reply_text("رجعلك للقائمة:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+    elif kind == "tag_rename":
+        tag_uuid, subject_uuid = awaiting[1], awaiting[2]
+        context.user_data["awaiting"] = None
+        db.rename_tag(tag_uuid, new_text)
+        await update.message.reply_text(f"تمام، صار اسم التصنيف: «{new_text}» ✅")
+        text, keyboard = _tagmgr_keyboard(subject_uuid)
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+    elif kind == "tag_new":
+        subject_uuid = awaiting[1]
+        context.user_data["awaiting"] = None
+        db.add_tag_to_subject(subject_uuid, new_text)
+        await update.message.reply_text(f"تمام، ضفت تصنيف جديد: «{new_text}» ✅")
+        text, keyboard = _tagmgr_keyboard(subject_uuid)
+        await update.message.reply_text(text, reply_markup=keyboard)
+
     elif kind == "new_tag_name":
         question_uuid = awaiting[1]
         context.user_data["awaiting"] = None
@@ -695,6 +861,11 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN مش موجود. تأكد من ملف .env")
+    if not db.TURSO_URL or not db.TURSO_TOKEN:
+        raise RuntimeError(
+            "TURSO_DATABASE_URL أو TURSO_AUTH_TOKEN مش موجودين - "
+            "لازم تنضافوا كـ Environment Variables على Render."
+        )
 
     db.init_db()
 
@@ -715,8 +886,9 @@ def main():
     app.add_handler(CallbackQueryHandler(editmode_browse, pattern=r"^editmode_browse$"))
     app.add_handler(CallbackQueryHandler(subject_chosen, pattern=r"^subject:"))
     app.add_handler(CallbackQueryHandler(tag_decision, pattern=r"^tag(yes|no)"))
-    app.add_handler(CallbackQueryHandler(browse_subject, pattern=r"^browsesubj:"))
-    app.add_handler(CallbackQueryHandler(browse_sheet, pattern=r"^browsesheet:"))
+    app.add_handler(CallbackQueryHandler(browse_date_page, pattern=r"^browsedate:"))
+    app.add_handler(CallbackQueryHandler(browse_sheet_grouped, pattern=r"^browsesheet2:"))
+    app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(edit_pick, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(edit_field, pattern=r"^editfield:"))
     app.add_handler(CallbackQueryHandler(answer_edit_pick, pattern=r"^ansedit:"))
@@ -724,6 +896,15 @@ def main():
     app.add_handler(CallbackQueryHandler(tag_remove, pattern=r"^tagrm:"))
     app.add_handler(CallbackQueryHandler(tag_add_prompt, pattern=r"^tagadd:"))
     app.add_handler(CallbackQueryHandler(tag_add_confirm, pattern=r"^edittag(yes|no)"))
+
+    app.add_handler(CallbackQueryHandler(start_tagmanage, pattern=r"^start_tagmanage$"))
+    app.add_handler(CallbackQueryHandler(tagmgr_subject, pattern=r"^tagmgr_subj:"))
+    app.add_handler(CallbackQueryHandler(tagmgr_pick, pattern=r"^tagmgr_pick:"))
+    app.add_handler(CallbackQueryHandler(tagmgr_rename_prompt, pattern=r"^tagmgr_rename:"))
+    app.add_handler(CallbackQueryHandler(tagmgr_merge_start, pattern=r"^tagmgr_mergestart:"))
+    app.add_handler(CallbackQueryHandler(tagmgr_merge_confirm, pattern=r"^tagmgr_mergeto:"))
+    app.add_handler(CallbackQueryHandler(tagmgr_merge_do, pattern=r"^tagmgr_mergedo:"))
+    app.add_handler(CallbackQueryHandler(tagmgr_new_prompt, pattern=r"^tagmgr_new:"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
