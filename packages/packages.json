@@ -1,0 +1,22 @@
+[
+  {
+    "id": "block1",
+    "name_ar": "الكتلة الأولى",
+    "name_en": "Block 1",
+    "google_drive_file_id": "",
+    "download_url": "",
+    "checksum": null,
+    "version": "1",
+    "description_ar": "14 مادة"
+  },
+  {
+    "id": "block2",
+    "name_ar": "الكتلة الثانية",
+    "name_en": "Block 2",
+    "google_drive_file_id": "",
+    "download_url": "",
+    "checksum": null,
+    "version": "1",
+    "description_ar": "14 مادة"
+  }
+]
