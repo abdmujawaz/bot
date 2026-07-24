@@ -6,13 +6,32 @@ api.py
 إضافية وبدون مشكلة مزامنة بين نسختين.
 """
 
+from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import firebase_admin
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from firebase_admin import auth as firebase_auth
+from firebase_admin import credentials
 
 import db
+
+# مجلد ملفات المواد (.db) الجاهزة للتحميل من التطبيق. لازم يكون هون بنفس
+# مستودع الكود (git) عشان ما ينمسح لما Render يعيد التشغيل (ephemeral filesystem).
+PACKAGES_DIR = Path(__file__).parent / "packages"
+
+# تهيئة Firebase Admin مرة وحدة بس، من متغير بيئة (Environment Variable)
+# اسمه FIREBASE_SERVICE_ACCOUNT_JSON يحتوي محتوى ملف مفتاح الخدمة كامل كنص JSON.
+import json
+import os
+
+_service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+if _service_account_json and not firebase_admin._apps:
+    _cred = credentials.Certificate(json.loads(_service_account_json))
+    firebase_admin.initialize_app(_cred)
 
 app = FastAPI(title="Question Bank API")
 
@@ -32,6 +51,44 @@ def health():
     return {"status": "ok", "message": "البوت شغال ✅"}
 
 
+def verify_firebase_token(authorization: Optional[str]) -> str:
+    """
+    بتتحقق من رأس Authorization: Bearer <token> وبترجع uid المستخدم لو صحيح.
+    بترمي HTTPException 401 لو التوكن ناقص أو غير صالح.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="لازم تسجل دخول أول")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+        return decoded["uid"]
+    except Exception:
+        raise HTTPException(status_code=401, detail="جلسة الدخول غير صالحة، سجّل دخول من جديد")
+
+
+@app.get("/api/packages/{package_id}/download")
+def download_package(package_id: str, authorization: Optional[str] = Header(None)):
+    """
+    تحميل ملف مادة (.db) - محمي: لازم تسجيل دخول فعلي (Firebase ID Token)
+    قبل ما يوصل الملف. الملفات نفسها موجودة جوا مجلد packages/ بنفس الكود.
+    """
+    verify_firebase_token(authorization)  # بيرمي 401 تلقائياً لو مش صالح
+
+    # حماية بسيطة من محاولة الخروج عن مجلد packages عبر أسماء ملفات ملغومة
+    safe_name = os.path.basename(package_id)
+    file_path = PACKAGES_DIR / f"{safe_name}.db"
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="المادة غير موجودة")
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/octet-stream",
+        filename=f"{safe_name}.db",
+    )
+
+
 @app.get("/api/subjects")
 def api_subjects():
     subjects = db.get_all_subjects_with_counts()
@@ -46,7 +103,8 @@ def api_all_sheets(
     limit: int = Query(default=100, ge=1, le=300),
     offset: int = Query(default=0, ge=0),
 ):
-    """كل الشيتات بكل المواد، مرتبة حسب التاريخ (الأحدث أولاً) - يستخدمها\n    مسار \"تصفح حسب الشيت\" الجديد اللي بيبلش من التاريخ مباشرة."""
+    """كل الشيتات بكل المواد، مرتبة حسب التاريخ (الأحدث أولاً) - يستخدمها
+    مسار "تصفح حسب الشيت" الجديد اللي بيبلش من التاريخ مباشرة."""
     sheets, total = db.get_all_sheets(limit=limit, offset=offset)
     return {
         "total": total,
